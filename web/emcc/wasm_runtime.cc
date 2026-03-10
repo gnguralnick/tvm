@@ -57,6 +57,8 @@
 #include "3rdparty/tvm-ffi/src/ffi/extra/library_module.cc"
 #include "3rdparty/tvm-ffi/src/ffi/extra/library_module_system_lib.cc"
 #include "3rdparty/tvm-ffi/src/ffi/extra/module.cc"
+#include "3rdparty/tvm-ffi/src/ffi/extra/json_parser.cc"
+#include "3rdparty/tvm-ffi/src/ffi/extra/json_writer.cc"
 #include "3rdparty/tvm-ffi/src/ffi/function.cc"
 #include "3rdparty/tvm-ffi/src/ffi/object.cc"
 #include "3rdparty/tvm-ffi/src/ffi/tensor.cc"
@@ -71,6 +73,7 @@
 #include "src/runtime/vm/lm_support.cc"
 #include "src/runtime/vm/paged_kv_cache.cc"
 #include "src/runtime/vm/rnn_state.cc"
+#include "src/runtime/vm/hybrid_state.cc"
 #include "src/runtime/vm/tensor_cache_support.cc"
 #include "src/runtime/vm/vm.cc"
 
