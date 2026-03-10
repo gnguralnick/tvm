@@ -73,6 +73,7 @@
 #include "src/runtime/vm/lm_support.cc"
 #include "src/runtime/vm/paged_kv_cache.cc"
 #include "src/runtime/vm/rnn_state.cc"
+#include "src/runtime/vm/hybrid_state.cc"
 #include "src/runtime/vm/tensor_cache_support.cc"
 #include "src/runtime/vm/vm.cc"
 
