@@ -420,6 +420,11 @@ export class WebGPUContext {
   protected debugShaderSubmitLimit = -1;
   // log and sync each step
   protected debugLogFinish = false;
+  // command batching state
+  private pendingEncoder: GPUCommandEncoder | null = null;
+  private pendingDispatchCount = 0;
+  private batchFlushThreshold = 64;
+  private batchPodArgBuffers: GPUBuffer[] = [];
 
   constructor(memory: Memory, device: GPUDevice) {
     this.memory = memory;
@@ -430,6 +435,7 @@ export class WebGPUContext {
    * Dispose context.
    */
   dispose() {
+    this.flushPendingDispatches();
     this.canvasRenderManager?.dispose();
     this.bufferTableFreeId = [];
     while (this.bufferTable.length != 0) {
@@ -442,9 +448,26 @@ export class WebGPUContext {
   }
 
   /**
+   * Flush any pending batched dispatches to the GPU.
+   */
+  private flushPendingDispatches(): void {
+    if (this.pendingEncoder !== null) {
+      const command = this.pendingEncoder.finish();
+      this.device.queue.submit([command]);
+      this.pendingEncoder = null;
+      this.pendingDispatchCount = 0;
+      for (const buf of this.batchPodArgBuffers) {
+        buf.destroy();
+      }
+      this.batchPodArgBuffers.length = 0;
+    }
+  }
+
+  /**
    * Wait for all pending GPU tasks to complete
    */
   async sync(): Promise<void> {
+    this.flushPendingDispatches();
     await this.device.queue.onSubmittedWorkDone();
   }
 
@@ -649,9 +672,6 @@ export class WebGPUContext {
           return;
         }
 
-        const commandEncoder = this.device.createCommandEncoder();
-        const compute = commandEncoder.beginComputePass();
-        compute.setPipeline(pipeline);
         const bindGroupEntries: Array<GPUBindGroupEntry> = [];
         const numBufferOrPodArgs = bufferArgIndices.length + podArgIndices.length;
 
@@ -697,7 +717,7 @@ export class WebGPUContext {
 
         // push pod buffer
         const sizeOfI32 = 4;
-        const podArgBuffer = this.getPodArgsBuffer((podArgIndices.length + 1) * sizeOfI32);
+        const podArgByteSize = (podArgIndices.length + 1) * sizeOfI32;
         const i32View = new Int32Array(podArgIndices.length + 1);
         const u32View = new Uint32Array(i32View.buffer);
         const f32View = new Float32Array(i32View.buffer);
@@ -717,6 +737,18 @@ export class WebGPUContext {
         }
         // always pass in dim z launching grid size in
         u32View[podArgIndices.length] = packDimX;
+
+        // Each dispatch gets its own pod args buffer since prior dispatches
+        // in the batch haven't consumed theirs yet.
+        let allocSize = 16;
+        while (allocSize < podArgByteSize) {
+          allocSize *= 2;
+        }
+        const podArgBuffer = tryCreateBuffer(this.device, {
+          size: allocSize,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.batchPodArgBuffers.push(podArgBuffer);
         this.device.queue.writeBuffer(podArgBuffer, 0, i32View.buffer);
 
         bindGroupEntries.push({
@@ -727,15 +759,24 @@ export class WebGPUContext {
           }
         });
 
+        if (this.pendingEncoder === null) {
+          this.pendingEncoder = this.device.createCommandEncoder();
+        }
+        // Each dispatch gets its own compute pass for implicit barriers
+        // between dispatches that read/write the same buffers.
+        const compute = this.pendingEncoder.beginComputePass();
+        compute.setPipeline(pipeline);
         compute.setBindGroup(0, this.device.createBindGroup({
           layout: bindGroupLayout,
           entries: bindGroupEntries
         }));
+        compute.dispatchWorkgroups(workDim[0], workDim[1], workDim[2]);
+        compute.end();
 
-        compute.dispatchWorkgroups(workDim[0], workDim[1], workDim[2])
-        compute.end()
-        const command = commandEncoder.finish();
-        this.device.queue.submit([command]);
+        this.pendingDispatchCount += 1;
+        if (this.pendingDispatchCount >= this.batchFlushThreshold) {
+          this.flushPendingDispatches();
+        }
 
         if (this.debugLogFinish) {
           const currCounter = this.shaderSubmitCounter;
@@ -862,6 +903,7 @@ export class WebGPUContext {
     toOffset: number,
     nbytes: number
   ): void {
+    this.flushPendingDispatches();
     // Perhaps it would be more useful to use a staging buffer?
     let rawBytes = this.memory.loadRawBytes(from, nbytes);
     if (rawBytes.length % 4 !== 0) {
@@ -886,6 +928,7 @@ export class WebGPUContext {
     to: Pointer,
     nbytes: number
   ): void {
+    this.flushPendingDispatches();
     // Perhaps it would be more useful to resuse a staging buffer?
     const gpuTemp = tryCreateBuffer(this.device, {
       size: nbytes,
@@ -917,6 +960,7 @@ export class WebGPUContext {
     toOffset: number,
     nbytes: number
   ): void {
+    this.flushPendingDispatches();
     const copyEncoder = this.device.createCommandEncoder();
     copyEncoder.copyBufferToBuffer(
       this.gpuBufferFromPtr(from),
