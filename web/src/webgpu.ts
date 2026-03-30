@@ -406,6 +406,8 @@ export class WebGPUContext {
   private canvasRenderManager?: CanvasRenderManager = undefined;
   // number of pod arg staging buffers
   private maxNumPodArgsStagingBuffers = 2;
+  // when enabled, reuse typed array views and return pod arg buffers to pool
+  private enablePodArgsOptimization = false;
   // flags for debugging
   // stats of the runtime.
   // peak allocation
@@ -507,6 +509,21 @@ export class WebGPUContext {
    */
   bindCanvas(canvas: HTMLCanvasElement) {
     this.canvasRenderManager = new CanvasRenderManager(this.device, canvas);
+  }
+
+  /**
+   * Enable or disable pod args optimization.
+   * When enabled, reuses typed array views across dispatches and returns
+   * pod arg buffers to the pool after use.
+   * @param flag Whether to enable the optimization.
+   */
+  setEnablePodArgsOptimization(flag: boolean): void {
+    this.enablePodArgsOptimization = flag;
+    if (flag) {
+      this.maxNumPodArgsStagingBuffers = 8;
+    } else {
+      this.maxNumPodArgsStagingBuffers = 2;
+    }
   }
 
   /**
@@ -640,6 +657,13 @@ export class WebGPUContext {
       bindGroupLayouts: [bindGroupLayout]
     });
 
+    // Pre-allocate typed array views for pod args (reused when optimization is enabled)
+    const maxPodArgs = podArgIndices.length + 1; // +1 for packGridDimX
+    const podArgsArrayBuffer = new ArrayBuffer(maxPodArgs * 4);
+    const i32ViewCached = new Int32Array(podArgsArrayBuffer);
+    const u32ViewCached = new Uint32Array(podArgsArrayBuffer);
+    const f32ViewCached = new Float32Array(podArgsArrayBuffer);
+
     // Function to create the pipeline.
     const createShaderFunc = (pipeline: GPUComputePipeline): Function => {
       const submitShader = (...args: Array<GPUPointer | number>): void => {
@@ -698,32 +722,54 @@ export class WebGPUContext {
         // push pod buffer
         const sizeOfI32 = 4;
         const podArgBuffer = this.getPodArgsBuffer((podArgIndices.length + 1) * sizeOfI32);
-        const i32View = new Int32Array(podArgIndices.length + 1);
-        const u32View = new Uint32Array(i32View.buffer);
-        const f32View = new Float32Array(i32View.buffer);
 
-        for (let i = 0; i < podArgIndices.length; ++i) {
-          const value = args[podArgIndices[i]];
-          const dtype = finfo.arg_types[podArgIndices[i]];
-          if (dtype.startsWith("int")) {
-            i32View[i] = value;
-          } else if (dtype.startsWith("uint")) {
-            u32View[i] = value;
-          } else if (dtype.startsWith("float")) {
-            f32View[i] = value;
-          } else {
-            throw Error("Unknown pod dtype " + dtype);
+        let podArgsBuffer: ArrayBuffer;
+        if (this.enablePodArgsOptimization) {
+          // Reuse pre-allocated typed array views
+          for (let i = 0; i < podArgIndices.length; ++i) {
+            const value = args[podArgIndices[i]];
+            const dtype = finfo.arg_types[podArgIndices[i]];
+            if (dtype.startsWith("int")) {
+              i32ViewCached[i] = value;
+            } else if (dtype.startsWith("uint")) {
+              u32ViewCached[i] = value;
+            } else if (dtype.startsWith("float")) {
+              f32ViewCached[i] = value;
+            } else {
+              throw Error("Unknown pod dtype " + dtype);
+            }
           }
+          u32ViewCached[podArgIndices.length] = packDimX;
+          podArgsBuffer = podArgsArrayBuffer;
+        } else {
+          const i32View = new Int32Array(podArgIndices.length + 1);
+          const u32View = new Uint32Array(i32View.buffer);
+          const f32View = new Float32Array(i32View.buffer);
+
+          for (let i = 0; i < podArgIndices.length; ++i) {
+            const value = args[podArgIndices[i]];
+            const dtype = finfo.arg_types[podArgIndices[i]];
+            if (dtype.startsWith("int")) {
+              i32View[i] = value;
+            } else if (dtype.startsWith("uint")) {
+              u32View[i] = value;
+            } else if (dtype.startsWith("float")) {
+              f32View[i] = value;
+            } else {
+              throw Error("Unknown pod dtype " + dtype);
+            }
+          }
+          u32View[podArgIndices.length] = packDimX;
+          podArgsBuffer = i32View.buffer;
         }
-        // always pass in dim z launching grid size in
-        u32View[podArgIndices.length] = packDimX;
-        this.device.queue.writeBuffer(podArgBuffer, 0, i32View.buffer);
+
+        this.device.queue.writeBuffer(podArgBuffer, 0, podArgsBuffer);
 
         bindGroupEntries.push({
           binding: bufferArgIndices.length,
           resource: {
             buffer: podArgBuffer,
-            size: i32View.buffer.byteLength
+            size: podArgsBuffer.byteLength
           }
         });
 
@@ -736,6 +782,11 @@ export class WebGPUContext {
         compute.end()
         const command = commandEncoder.finish();
         this.device.queue.submit([command]);
+
+        // Return pod arg buffer to pool for reuse (fixes pool drain bug)
+        if (this.enablePodArgsOptimization) {
+          this.podArgStagingBuffers.push(podArgBuffer);
+        }
 
         if (this.debugLogFinish) {
           const currCounter = this.shaderSubmitCounter;
@@ -821,6 +872,10 @@ export class WebGPUContext {
         nbytes: number
       ): void => {
         this.deviceCopyWithinGPU(from, fromOffset, to, toOffset, nbytes);
+      };
+    } else if (name == "setEnablePodArgsOptimization") {
+      return (flag: number): void => {
+        this.setEnablePodArgsOptimization(flag !== 0);
       };
     } else {
       throw new Error("Unknown DeviceAPI function " + name);
