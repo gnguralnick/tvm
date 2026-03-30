@@ -420,6 +420,10 @@ export class WebGPUContext {
   protected debugShaderSubmitLimit = -1;
   // log and sync each step
   protected debugLogFinish = false;
+  // bind group caching
+  private enableBindGroupCaching = false;
+  private bindGroupCache: Map<string, { bindGroup: GPUBindGroup; podArgBuffer: GPUBuffer }> = new Map();
+  private maxBindGroupCacheSize = 512;
 
   constructor(memory: Memory, device: GPUDevice) {
     this.memory = memory;
@@ -431,6 +435,7 @@ export class WebGPUContext {
    */
   dispose() {
     this.canvasRenderManager?.dispose();
+    this.bindGroupCache.clear();
     this.bufferTableFreeId = [];
     while (this.bufferTable.length != 0) {
       this.bufferTable.pop()?.destroy();
@@ -456,6 +461,16 @@ export class WebGPUContext {
     info += ", all-memory=" + Math.ceil(this.allAllocatedBytes / (1 << 20)) + " MB";
     info += ", shader-submissions=" + this.shaderSubmitCounter;
     return info;
+  }
+
+  /**
+   * Enable or disable bind group caching.
+   */
+  setEnableBindGroupCaching(flag: boolean): void {
+    this.enableBindGroupCaching = flag;
+    if (!flag) {
+      this.bindGroupCache.clear();
+    }
   }
 
   /**
@@ -686,19 +701,15 @@ export class WebGPUContext {
           assert(wl_x * wl_z >= packDimX);
         }
 
+        // Collect buffer pointers and pod arg values for cache key
+        const bufferPtrs: Array<GPUPointer> = [];
         for (let i = 0; i < bufferArgIndices.length; ++i) {
-          bindGroupEntries.push({
-            binding: i,
-            resource: {
-              buffer: this.gpuBufferFromPtr(args[bufferArgIndices[i]])
-            }
-          });
+          bufferPtrs.push(args[bufferArgIndices[i]]);
         }
 
-        // push pod buffer
         const sizeOfI32 = 4;
-        const podArgBuffer = this.getPodArgsBuffer((podArgIndices.length + 1) * sizeOfI32);
-        const i32View = new Int32Array(podArgIndices.length + 1);
+        const podArgCount = podArgIndices.length + 1;
+        const i32View = new Int32Array(podArgCount);
         const u32View = new Uint32Array(i32View.buffer);
         const f32View = new Float32Array(i32View.buffer);
 
@@ -717,20 +728,68 @@ export class WebGPUContext {
         }
         // always pass in dim z launching grid size in
         u32View[podArgIndices.length] = packDimX;
-        this.device.queue.writeBuffer(podArgBuffer, 0, i32View.buffer);
 
-        bindGroupEntries.push({
-          binding: bufferArgIndices.length,
-          resource: {
-            buffer: podArgBuffer,
-            size: i32View.buffer.byteLength
+        let bindGroup: GPUBindGroup;
+
+        if (this.enableBindGroupCaching) {
+          const cacheKey = finfo.name + "|" + bufferPtrs.join(",") + "|" + u32View.join(",");
+          const cached = this.bindGroupCache.get(cacheKey);
+          if (cached !== undefined) {
+            bindGroup = cached.bindGroup;
+          } else {
+            for (let i = 0; i < bufferArgIndices.length; ++i) {
+              bindGroupEntries.push({
+                binding: i,
+                resource: {
+                  buffer: this.gpuBufferFromPtr(bufferPtrs[i])
+                }
+              });
+            }
+            const podArgBuffer = this.getPodArgsBuffer(podArgCount * sizeOfI32);
+            this.device.queue.writeBuffer(podArgBuffer, 0, i32View.buffer);
+            bindGroupEntries.push({
+              binding: bufferArgIndices.length,
+              resource: {
+                buffer: podArgBuffer,
+                size: i32View.buffer.byteLength
+              }
+            });
+            bindGroup = this.device.createBindGroup({
+              layout: bindGroupLayout,
+              entries: bindGroupEntries
+            });
+            // Evict oldest entry if cache is full
+            if (this.bindGroupCache.size >= this.maxBindGroupCacheSize) {
+              const firstKey = this.bindGroupCache.keys().next().value!;
+              this.bindGroupCache.delete(firstKey);
+            }
+            this.bindGroupCache.set(cacheKey, { bindGroup, podArgBuffer });
           }
-        });
+        } else {
+          for (let i = 0; i < bufferArgIndices.length; ++i) {
+            bindGroupEntries.push({
+              binding: i,
+              resource: {
+                buffer: this.gpuBufferFromPtr(bufferPtrs[i])
+              }
+            });
+          }
+          const podArgBuffer = this.getPodArgsBuffer(podArgCount * sizeOfI32);
+          this.device.queue.writeBuffer(podArgBuffer, 0, i32View.buffer);
+          bindGroupEntries.push({
+            binding: bufferArgIndices.length,
+            resource: {
+              buffer: podArgBuffer,
+              size: i32View.buffer.byteLength
+            }
+          });
+          bindGroup = this.device.createBindGroup({
+            layout: bindGroupLayout,
+            entries: bindGroupEntries
+          });
+        }
 
-        compute.setBindGroup(0, this.device.createBindGroup({
-          layout: bindGroupLayout,
-          entries: bindGroupEntries
-        }));
+        compute.setBindGroup(0, bindGroup);
 
         compute.dispatchWorkgroups(workDim[0], workDim[1], workDim[2])
         compute.end()
@@ -822,6 +881,10 @@ export class WebGPUContext {
       ): void => {
         this.deviceCopyWithinGPU(from, fromOffset, to, toOffset, nbytes);
       };
+    } else if (name == "setEnableBindGroupCaching") {
+      return (flag: number): void => {
+        this.setEnableBindGroupCaching(flag !== 0);
+      };
     } else {
       throw new Error("Unknown DeviceAPI function " + name);
     }
@@ -854,6 +917,10 @@ export class WebGPUContext {
     this.bufferTableFreeId.push(idx);
     this.currAllocatedBytes -= buffer.size;
     buffer.destroy();
+    // Invalidate any cached bind groups referencing this buffer
+    if (this.enableBindGroupCaching && this.bindGroupCache.size > 0) {
+      this.bindGroupCache.clear();
+    }
   }
 
   private deviceCopyToGPU(
